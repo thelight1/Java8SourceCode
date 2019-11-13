@@ -118,6 +118,7 @@ public abstract class ServerSocketChannel
      *
      * @return  The valid-operation set
      */
+    //ServerSocketChannel只对ACCEPT事件感兴趣
     public final int validOps() {
         return SelectionKey.OP_ACCEPT;
     }
@@ -266,6 +267,7 @@ public abstract class ServerSocketChannel
      * @throws  IOException
      *          If some other I/O error occurs
      */
+    //如果是非阻塞模式的，当没有连接时，立刻返回null
     public abstract SocketChannel accept() throws IOException;
 
     /**
