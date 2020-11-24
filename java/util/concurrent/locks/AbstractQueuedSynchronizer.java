@@ -102,6 +102,7 @@ import sun.misc.Unsafe;
  * define a {@code readObject} method that restores this to a known
  * initial state upon deserialization.
  *
+ * 队列同步器的使用方法
  * <h3>Usage</h3>
  *
  * <p>To use this class as the basis of a synchronizer, redefine the

@@ -270,6 +270,8 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
 
     /*
      * Overview:
+     * 首要目标是：维持并发读的同时最小化更新时的竞争。
+     * 第二个目标是：相较于HashMap更小的空间消耗，以及，支持多个线程在空table上的高速插入
      *
      * The primary design goal of this hash table is to maintain
      * concurrent readability (typically method get(), but also
@@ -278,6 +280,14 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
      * the same or better than java.util.HashMap, and to support high
      * initial insertion rates on an empty table by many threads.
      *
+     * 多数Node是基本Node（拥有hash，key，value，next字段）。
+     * 但也有各种Node的子类存在：
+     * TreeNode 用在平衡树中（红黑树），而不是list中
+     * TreeBin  维护了TreeNode集合的根（也就是红黑树的根）
+     * ForwardingNode 在resize期间，放在bin的head部分
+     * ReservationNode 在computeIfAbsent及相关方法计算值得时候用作占位符
+     * TreeBin,ForwardingNode,ReservationNode这几种Node的hash值是负的，key、value是null，可以与正常的Node区分开来。
+     * （其实就是上面这几种特殊的Node用作特殊的用途，不是正常的Node）
      * This map usually acts as a binned (bucketed) hash table.  Each
      * key-value mapping is held in a Node.  Most nodes are instances
      * of the basic Node class with hash, key, value, and next
@@ -294,6 +304,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
      * so the impact of carrying around some unused fields is
      * insignificant.)
      *
+     * table延迟初始化，在第一次插入的时候才真正初始化。
      * The table is lazily initialized to a power-of-two size upon the
      * first insertion.  Each bin in the table normally contains a
      * list of Nodes (most often, the list has only zero or one Node).
@@ -307,6 +318,10 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
      * constraints.  Nodes with negative hash fields are specially
      * handled or ignored in map methods.
      *
+     * 往空桶中插入第一个Node是通过CAS实现的。
+     * 对于其他Node的更新操作（insert，delete，replace）都需要锁，
+     * 为了减少空间消耗，不想为每个桶关联一个锁，于是，我们使用每个桶的第一个Node对象作为相对应桶的锁。
+     * 这个锁是通过内置的synchronized实现的。
      * Insertion (via put or its variants) of the first node in an
      * empty bin is performed by just CASing it to the bin.  This is
      * by far the most common case for put operations under most
@@ -317,12 +332,17 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
      * a lock. Locking support for these locks relies on builtin
      * "synchronized" monitors.
      *
+     * (主要讲了为什么要将每个桶的第一个Node节点作为它的锁)
+     * 当一个Node锁被持有了，任何更新操作必须首先验证这个Node是否仍然是桶的第一个Node，如果不是，就需要retry
+     * 因为新的Node节点总是会插入到桶（list）的后面，一旦一个Node是桶的第一个Node，那么它将永远是第一个Node，
+     * 除非它被删除了，或者，桶失效了（在resize的时候）
      * Using the first node of a list as a lock does not by itself
      * suffice though: When a node is locked, any update must first
      * validate that it is still the first node after locking it, and
      * retry if not. Because new nodes are always appended to lists,
      * once a node is first in a bin, it remains first until deleted
      * or the bin becomes invalidated (upon resizing).
+     *
      *
      * The main disadvantage of per-bin locks is that other update
      * operations on other nodes in a bin list protected by the same
@@ -370,6 +390,8 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
      * traversal pointers as regular nodes, so can be traversed in
      * iterators in the same way.
      *
+     * ====================================讲了resize==========================================
+     * (下面这段主要讲了resize的过程）
      * The table is resized when occupancy exceeds a percentage
      * threshold (nominally, 0.75, but see below).  Any thread
      * noticing an overfull bin may assist in resizing after the
@@ -478,6 +500,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
      * exhausted, whichever comes first. These cases are not fast, but
      * maximize aggregate expected throughput.
      *
+     * ========================讲了与前面版本（如1.7）兼容，做了哪些工作====================
      * Maintaining API and serialization compatibility with previous
      * versions of this class introduces several oddities. Mainly: We
      * leave untouched but unused constructor arguments refering to
@@ -523,6 +546,9 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
     static final int MAX_ARRAY_SIZE = Integer.MAX_VALUE - 8;
 
     /**
+     * 默认并发度。这个字段在1.8里面已经不用了。
+     * 但是为了与前面1.7等版本的兼容，还是定义在这里。
+     * （TODO 涉及问题：ConcurrentHashMap 1.7和1.8的并发度问题）
      * The default concurrency level for this table. Unused but
      * defined for compatibility with previous versions of this class.
      */
@@ -578,6 +604,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
     private static int RESIZE_STAMP_BITS = 16;
 
     /**
+     * TODO：帮助resize的线程的最大数量？那么是如何帮助resize的？
      * The maximum number of threads that can help resize.
      * Must fit in 32 - RESIZE_STAMP_BITS bits.
      */
@@ -590,6 +617,9 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
 
     /*
      * Encodings for Node hash fields. See above for explanation.
+     */
+    /*
+    TODO：如果桶的第一个Node节点的hash值为MOVED，表示正在resize？
      */
     static final int MOVED     = -1; // hash for forwarding nodes
     static final int TREEBIN   = -2; // hash for roots of trees
@@ -791,6 +821,15 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
      * when table is null, holds the initial table size to use upon
      * creation, or 0 for default. After initialization, holds the
      * next element count value upon which to resize the table.
+     *
+     * 作用：用于控制初始化和resize
+     * 负数的时候，表示table正在被初始化或者resize
+     * （1）-1，表示初始化中
+     * （2）-(1+线程数目），表示reisze中
+     *
+     * 正数的时候，
+     * 初始化前，table是null的时候，表示table的size的初始值（TODO：是指table数组的长度？？？）
+     * 初始化后，表示下一次resize后的元素数量（TODO：应该就是下一次resize后的table数组的长度）
      */
     private transient volatile int sizeCtl;
 
@@ -907,6 +946,9 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
      * {@inheritDoc}
      */
     public int size() {
+        /**
+         * map中的kv的个数 = baseCount + cells数组中value的和
+         */
         long n = sumCount();
         return ((n < 0L) ? 0 :
                 (n > (long)Integer.MAX_VALUE) ? Integer.MAX_VALUE :
@@ -1010,22 +1052,34 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
     final V putVal(K key, V value, boolean onlyIfAbsent) {
         if (key == null || value == null) throw new NullPointerException();
         int hash = spread(key.hashCode());
+        /**
+         * TODO: 表示什么意思？
+         */
         int binCount = 0;
         for (Node<K,V>[] tab = table;;) {
             Node<K,V> f; int n, i, fh;
+            //如果table未初始化，初始化table
             if (tab == null || (n = tab.length) == 0)
                 tab = initTable();
+            //如果桶的第一个Node为null，使用CAS试图添加Node节点为桶的第一个节点
             else if ((f = tabAt(tab, i = (n - 1) & hash)) == null) {
                 if (casTabAt(tab, i, null,
                              new Node<K,V>(hash, key, value, null)))
                     break;                   // no lock when adding to empty bin
             }
+            //如果桶的第一个Node不为null，且第一个Node的hash为MOVED，表示正在进行resize
+            //TODO：resize的整个过程是怎样的？
             else if ((fh = f.hash) == MOVED)
                 tab = helpTransfer(tab, f);
+            //如果桶的第一个Node不为null，且也没有在resize，表示可以执行插入过程
             else {
                 V oldVal = null;
+                /*
+                重要：每个桶的第一个Node作为这个桶的lock
+                 */
                 synchronized (f) {
                     if (tabAt(tab, i) == f) {
+                        //如果桶的第一个Node的hash值大于等于0，TODO：说明是链表？
                         if (fh >= 0) {
                             binCount = 1;
                             for (Node<K,V> e = f;; ++binCount) {
@@ -1046,6 +1100,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
                                 }
                             }
                         }
+                        //如果桶的第一个Node的hash值小于0
                         else if (f instanceof TreeBin) {
                             Node<K,V> p;
                             binCount = 2;
@@ -2294,6 +2349,10 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
     /**
      * Helps transfer if a resize is in progress.
      */
+    /* 参数的意义：
+    tab是table数组
+    f是某个桶的第一个Node
+     */
     final Node<K,V>[] helpTransfer(Node<K,V>[] tab, Node<K,V> f) {
         Node<K,V>[] nextTab; int sc;
         if (tab != null && (f instanceof ForwardingNode) &&
@@ -2502,6 +2561,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
     /**
      * A padded cell for distributing counts.  Adapted from LongAdder
      * and Striped64.  See their internal docs for explanation.
+     * 为了解决缓存行的伪共享问题。
      */
     @sun.misc.Contended static final class CounterCell {
         volatile long value;
